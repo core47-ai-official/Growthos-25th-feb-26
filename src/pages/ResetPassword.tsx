@@ -9,6 +9,18 @@ import { useToast } from "@/hooks/use-toast";
 import { Eye, EyeOff, Loader2, ArrowLeft, Mail, Lock, CheckCircle2 } from "lucide-react";
 import { Link, useNavigate } from "react-router-dom";
 import { FieldError } from "@/components/ui/error-message";
+// Capture URL params IMMEDIATELY before Supabase or React can clear them
+const capturedParams = {
+  tokenHash: new URLSearchParams(window.location.search).get('token_hash'),
+  type: new URLSearchParams(window.location.search).get('type'),
+  code: new URLSearchParams(window.location.search).get('code'),
+  error: new URLSearchParams(window.location.search).get('error'),
+  errorCode: new URLSearchParams(window.location.search).get('error_code'),
+  errorDescription: new URLSearchParams(window.location.search).get('error_description'),
+  hash: window.location.hash,
+};
+console.log('[ResetPassword] Captured params at module level:', capturedParams);
+
 const ResetPassword = () => {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -29,102 +41,106 @@ const ResetPassword = () => {
 
   // Check if we're in password reset mode (user clicked link from email)
   useEffect(() => {
+    let resolved = false;
+    const markResolved = (mode: boolean, error?: string) => {
+      if (resolved) return;
+      resolved = true;
+      console.log('[ResetPassword] markResolved called:', { mode, error });
+      if (error) setLinkError(error);
+      if (mode) setIsResetMode(true);
+      setIsCheckingToken(false);
+    };
+
+    // Listen for PASSWORD_RECOVERY event from Supabase auto-exchange
+    const {
+      data: { subscription }
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      console.log('[ResetPassword] Auth event:', event);
+      if (event === 'PASSWORD_RECOVERY') {
+        window.history.replaceState({}, document.title, window.location.pathname);
+        markResolved(true);
+      }
+    });
+
     const handlePasswordResetToken = async () => {
       try {
-        // Check for error parameters FIRST (Supabase redirects with these when link is expired/invalid)
-        const urlParams = new URLSearchParams(window.location.search);
-        const error = urlParams.get('error');
-        const errorCode = urlParams.get('error_code');
-        const errorDescription = urlParams.get('error_description');
-        
-        // Also check hash for error parameters
-        const errorHashParams = new URLSearchParams(window.location.hash.substring(1));
-        const hashError = errorHashParams.get('error');
-        const hashErrorCode = errorHashParams.get('error_code');
-        const hashErrorDescription = errorHashParams.get('error_description');
-        
-        // If any error is present, show the error message
-        if (error || hashError || errorCode === 'otp_expired' || hashErrorCode === 'otp_expired') {
-          const description = errorDescription || hashErrorDescription || 'Email link is invalid or has expired';
-          setLinkError(decodeURIComponent(description.replace(/\+/g, ' ')));
-          // Clean up URL
+        const hashStr = capturedParams.hash.substring(1);
+        const hashParams = new URLSearchParams(hashStr);
+
+        console.log('[ResetPassword] Using captured params:', capturedParams);
+
+        // Check for error parameters
+        const error = capturedParams.error || hashParams.get('error');
+        const errorCode = capturedParams.errorCode || hashParams.get('error_code');
+        const errorDescription = capturedParams.errorDescription || hashParams.get('error_description');
+
+        if (error || errorCode === 'otp_expired') {
+          const desc = errorDescription || 'Email link is invalid or has expired';
           window.history.replaceState({}, document.title, window.location.pathname);
-          setIsCheckingToken(false);
+          markResolved(false, decodeURIComponent(desc.replace(/\+/g, ' ')));
           return;
         }
-        
-        // Check for PKCE code in query parameters (modern Supabase format)
-        const code = urlParams.get('code');
-        
-        if (code) {
-          // The Supabase client with detectSessionInUrl:true may already be exchanging
-          // the code automatically. First check if a session already exists.
-          const { data: sessionData } = await supabase.auth.getSession();
-          
-          if (sessionData.session) {
-            // Session was already established by auto-detection
-            setIsResetMode(true);
-            window.history.replaceState({}, document.title, window.location.pathname);
-            setIsCheckingToken(false);
-            return;
+
+        // Handle token_hash flow (link goes directly to our app, not Supabase /verify)
+        if (capturedParams.tokenHash && capturedParams.type === 'recovery') {
+          console.log('[ResetPassword] token_hash found, verifying OTP...');
+          window.history.replaceState({}, document.title, window.location.pathname);
+          const { error: otpError } = await supabase.auth.verifyOtp({
+            token_hash: capturedParams.tokenHash,
+            type: 'recovery',
+          });
+          if (otpError) {
+            console.error('[ResetPassword] OTP verification error:', otpError);
+            markResolved(false, "This password reset link has expired or is invalid. Please request a new one.");
+          } else {
+            console.log('[ResetPassword] OTP verification successful!');
+            markResolved(true);
           }
-          
-          // Try manual exchange as fallback
-          const { data, error } = await supabase.auth.exchangeCodeForSession(code);
-          
-          if (error) {
-            console.error('Code exchange error:', error);
-            // One more check - session might have been set by onAuthStateChange
-            const { data: retrySession } = await supabase.auth.getSession();
-            if (retrySession.session) {
-              setIsResetMode(true);
-              window.history.replaceState({}, document.title, window.location.pathname);
-              setIsCheckingToken(false);
-              return;
-            }
-            setLinkError("This password reset link has expired or is invalid. Please request a new one.");
-            setIsCheckingToken(false);
-            return;
-          }
-          
-          if (data.session) {
-            setIsResetMode(true);
-            window.history.replaceState({}, document.title, window.location.pathname);
-          }
-          setIsCheckingToken(false);
           return;
         }
-        
-        // Check for hash parameters (legacy format)
-        const hashParams = new URLSearchParams(window.location.hash.substring(1));
+
+        // Legacy: hash-based recovery token (implicit flow)
         const accessToken = hashParams.get('access_token');
-        const type = hashParams.get('type');
-        
-        if (accessToken && type === 'recovery') {
-          setIsResetMode(true);
+        const hashType = hashParams.get('type');
+        if (accessToken && hashType === 'recovery') {
+          markResolved(true);
+          return;
         }
-        
-        setIsCheckingToken(false);
-      } catch (error) {
-        console.error('Token handling error:', error);
-        setLinkError("An error occurred while processing your reset link. Please try again.");
-        setIsCheckingToken(false);
+
+        // Legacy: code-based PKCE flow
+        const code = capturedParams.code;
+        if (code) {
+          console.log('[ResetPassword] Code found, exchanging...');
+          const { data, error: exchangeErr } = await supabase.auth.exchangeCodeForSession(code);
+          window.history.replaceState({}, document.title, window.location.pathname);
+          if (exchangeErr) {
+            console.error('[ResetPassword] Exchange error:', exchangeErr);
+            markResolved(false, "This password reset link has expired or is invalid. Please request a new one.");
+          } else if (data.session) {
+            markResolved(true);
+          } else {
+            markResolved(false, "This password reset link has expired or is invalid. Please request a new one.");
+          }
+          return;
+        }
+
+        // No recovery indicators — check existing session
+        const { data: existingSession } = await supabase.auth.getSession();
+        if (existingSession.session) {
+          markResolved(true);
+          return;
+        }
+
+        // Show request form
+        markResolved(false);
+      } catch (err) {
+        console.error('[ResetPassword] Token handling error:', err);
+        markResolved(false, "An error occurred while processing your reset link. Please try again.");
       }
     };
 
     handlePasswordResetToken();
 
-    // Listen for auth state changes (for when user clicks email link)
-    const {
-      data: {
-        subscription
-      }
-    } = supabase.auth.onAuthStateChange((event, session) => {
-      if (event === 'PASSWORD_RECOVERY') {
-        setIsResetMode(true);
-        setIsCheckingToken(false);
-      }
-    });
     return () => subscription.unsubscribe();
   }, []);
   const handleRequestReset = async (e: React.FormEvent) => {
